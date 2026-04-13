@@ -56,6 +56,8 @@
           case 'SUBTRACT': newVal = newVal === null ? val : newVal - val; break;
           case 'MULTIPLY': newVal = newVal === null ? val : newVal * val; break;
           case 'DIVIDE': newVal = newVal === null ? val : (val !== 0 ? newVal / val : newVal); break;
+          case 'MIN': newVal = newVal === null ? val : Math.min(newVal, val); break;
+          case 'MAX': newVal = newVal === null ? val : Math.max(newVal, val); break;
           case 'COUNT': newVal = (newVal || 0) + 1; break;
           case 'CONCAT': newVal = newVal === null ? String(val) : `${newVal}, ${val}`; break;
           default: break;
@@ -316,6 +318,8 @@
                           <option value="SUBTRACT">Subtract (-)</option>
                           <option value="MULTIPLY">Multiply (*)</option>
                           <option value="DIVIDE">Divide (/)</option>
+                          <option value="MIN">Minimum (Min)</option>
+                          <option value="MAX">Maximum (Max)</option>
                         </optgroup>
                         <optgroup label="Text (Strings)">
                           <option value="CONCAT">Append / Concat</option>
