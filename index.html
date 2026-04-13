@@ -136,8 +136,7 @@
 
       const handlePublishSubmit = (e) => {
         handlePublish(pubPayload, pubTags, e);
-        setPubPayload('');
-        setPubTags('');
+        // The text box values are intentionally kept so users don't have to re-enter them
       };
 
       const handleAddConsumer = (e) => {
@@ -157,8 +156,7 @@
         });
 
         setConsumers([...consumers, initialConsumer]);
-        setNewConsName('');
-        setNewConsFilter('');
+        // The text box values are intentionally kept so users don't have to re-enter them
       };
 
       const handleRepublish = (consumer, republishTag) => {
