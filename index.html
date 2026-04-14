@@ -39,12 +39,16 @@
     const Tag = (p) => <Icon {...p}><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></Icon>;
     const Layout = (p) => <Icon {...p}><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></Icon>;
     const Layers = (p) => <Icon {...p}><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></Icon>;
+    const Pause = (p) => <Icon {...p}><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></Icon>;
+    const Play = (p) => <Icon {...p}><polygon points="5 3 19 12 5 21 5 3"/></Icon>;
+    const Edit = (p) => <Icon {...p}><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></Icon>;
 
     // --- Reducer Logic ---
     const processLog = (consumer, logEntry) => {
       // Check filter: if consumer has a filter tag, the log must include it
       if (consumer.filterTag && !logEntry.tags.includes(consumer.filterTag)) {
-        return consumer;
+        // Advance seqNum even if filtered so we don't infinitely process it
+        return { ...consumer, lastProcessedSeqNum: logEntry.seqNum };
       }
 
       let newVal = consumer.currentValue;
@@ -59,16 +63,20 @@
           case 'MIN': newVal = newVal === null ? val : Math.min(newVal, val); break;
           case 'MAX': newVal = newVal === null ? val : Math.max(newVal, val); break;
           case 'COUNT': newVal = (newVal || 0) + 1; break;
-          case 'CONCAT': newVal = newVal === null ? String(val) : `${newVal}, ${val}`; break;
+          case 'REPLACE': newVal = val; break;
+          case 'CONCAT': newVal = newVal === null ? String(val) : `${newVal} ${val}`; break;
+          case 'CONCAT_COMMA': newVal = newVal === null ? String(val) : `${newVal}, ${val}`; break;
           default: break;
         }
       } else {
         // String processing
         switch (consumer.reducer) {
           case 'CONCAT': newVal = newVal === null ? val : `${newVal} ${val}`; break;
+          case 'CONCAT_COMMA': newVal = newVal === null ? val : `${newVal}, ${val}`; break;
           case 'UPPERCASE_LATEST': newVal = String(val).toUpperCase(); break;
           case 'LOWERCASE_LATEST': newVal = String(val).toLowerCase(); break;
           case 'COUNT': newVal = (newVal || 0) + 1; break;
+          case 'REPLACE': newVal = val; break;
           default: break; // If math is applied to string, we ignore to prevent NaNs
         }
       }
@@ -101,21 +109,64 @@
         }
       }, [logs]);
 
-      // Reactive processing: when logs change, consumers update
+      // 1. Reactive processing: when logs change, consumers update their materialized state
       useEffect(() => {
         if (logs.length === 0) return;
         
-        setConsumers(prev => prev.map(c => {
-          let updatedC = { ...c };
-          const unprocessedLogs = logs.filter(l => l.seqNum > c.lastProcessedSeqNum);
-          
-          unprocessedLogs.forEach(l => {
-            updatedC = processLog(updatedC, l);
+        setConsumers(prev => {
+          let hasChanges = false;
+          const next = prev.map(c => {
+            let updatedC = { ...c };
+            const unprocessedLogs = logs.filter(l => l.seqNum > c.lastProcessedSeqNum);
+            
+            if (unprocessedLogs.length > 0) {
+              hasChanges = true;
+              unprocessedLogs.forEach(l => {
+                updatedC = processLog(updatedC, l);
+              });
+            }
+            
+            return updatedC;
           });
-          
-          return updatedC;
-        }));
+          return hasChanges ? next : prev;
+        });
       }, [logs]);
+
+      // 2. Auto-republish pipeline: strictly monitors consumers and fires when state changes
+      useEffect(() => {
+        const toPublish = consumers.filter(c => 
+          c.republishActive && 
+          c.republishTag && 
+          c.currentValue !== null && 
+          c.currentValue !== c.lastPublishedValue
+        );
+
+        if (toPublish.length > 0) {
+          // Immediately mark them as published to prevent infinite loops / double triggers
+          setConsumers(prev => prev.map(c => {
+            const match = toPublish.find(tp => tp.id === c.id);
+            return match ? { ...c, lastPublishedValue: c.currentValue } : c;
+          }));
+
+          // Queue the actual log generation into the stream with a visual delay
+          setTimeout(() => {
+            setLogs(prev => {
+              let newSeq = prev.length > 0 ? prev[prev.length - 1].seqNum : 0;
+              const newLogEntries = toPublish.map((item, idx) => {
+                const payloadStr = String(item.currentValue);
+                const isNumber = !isNaN(parseFloat(payloadStr)) && isFinite(payloadStr);
+                return {
+                  seqNum: newSeq + idx + 1,
+                  payload: isNumber ? parseFloat(payloadStr) : payloadStr,
+                  type: isNumber ? 'number' : 'string',
+                  tags: [item.republishTag]
+                };
+              });
+              return [...prev, ...newLogEntries];
+            });
+          }, 800);
+        }
+      }, [consumers]);
 
       // --- Handlers ---
       const handlePublish = (payloadStr, tagsStr, e = null) => {
@@ -157,13 +208,32 @@
           initialConsumer = processLog(initialConsumer, log);
         });
 
+        // Initialize republish state
+        initialConsumer.republishTag = '';
+        initialConsumer.republishActive = false;
+        initialConsumer.lastPublishedValue = null;
+
         setConsumers([...consumers, initialConsumer]);
         // The text box values are intentionally kept so users don't have to re-enter them
       };
 
-      const handleRepublish = (consumer, republishTag) => {
-        if (consumer.currentValue === null) return;
-        handlePublish(String(consumer.currentValue), republishTag);
+      const handleSetRepublish = (consumerId, tag, active) => {
+        const consumer = consumers.find(c => c.id === consumerId);
+        
+        // Immediate publish if we are turning it on and there is an unpublished value difference
+        if (consumer && active && consumer.currentValue !== null && consumer.currentValue !== consumer.lastPublishedValue) {
+          handlePublish(String(consumer.currentValue), tag);
+        }
+
+        setConsumers(prev => prev.map(c => 
+          c.id === consumerId ? { 
+            ...c, 
+            republishTag: tag, 
+            republishActive: active,
+            // Track what we just published so it doesn't double-trigger in useEffect
+            lastPublishedValue: active ? c.currentValue : c.lastPublishedValue
+          } : c
+        ));
       };
 
       return (
@@ -322,11 +392,13 @@
                           <option value="MAX">Maximum (Max)</option>
                         </optgroup>
                         <optgroup label="Text (Strings)">
-                          <option value="CONCAT">Append / Concat</option>
+                          <option value="CONCAT">Append with space</option>
+                          <option value="CONCAT_COMMA">Append with separator (,)</option>
                           <option value="UPPERCASE_LATEST">Uppercase (Latest)</option>
                           <option value="LOWERCASE_LATEST">Lowercase (Latest)</option>
                         </optgroup>
                         <optgroup label="General">
+                          <option value="REPLACE">Replace (Latest)</option>
                           <option value="COUNT">Count Events</option>
                         </optgroup>
                       </select>
@@ -355,7 +427,7 @@
                     <ConsumerCard 
                       key={consumer.id} 
                       consumer={consumer} 
-                      onRepublish={handleRepublish} 
+                      onSetRepublish={handleSetRepublish} 
                     />
                   ))
                 )}
@@ -369,9 +441,12 @@
 
     // --- Subcomponents ---
 
-    function ConsumerCard({ consumer, onRepublish }) {
-      const [republishTag, setRepublishTag] = useState(`${consumer.name.toLowerCase().replace(/\s+/g, '-')}-output`);
-      const [showRepublishOpts, setShowRepublishOpts] = useState(false);
+    function ConsumerCard({ consumer, onSetRepublish }) {
+      const [editMode, setEditMode] = useState(false);
+      const [draftTag, setDraftTag] = useState(consumer.republishTag || `${consumer.name.toLowerCase().replace(/\s+/g, '-')}-output`);
+
+      const isActive = consumer.republishActive;
+      const hasConfig = !!consumer.republishTag;
 
       return (
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden flex flex-col relative">
@@ -410,43 +485,79 @@
           </div>
 
           {/* Republish Section */}
-          <div className="bg-slate-50 p-4">
-            {!showRepublishOpts ? (
-              <button 
-                onClick={() => setShowRepublishOpts(true)}
-                disabled={consumer.currentValue === null}
-                className="w-full flex items-center justify-center space-x-2 py-2 px-4 rounded-lg text-sm font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 disabled:opacity-50 disabled:hover:bg-blue-50 transition-colors"
-              >
-                <RefreshCw size={16} />
-                <span>Republish to Log</span>
-              </button>
-            ) : (
-              <div className="flex flex-col space-y-2 animate-in fade-in slide-in-from-top-2">
-                <label className="text-xs font-semibold text-slate-500">Publish as tag:</label>
+          <div className="bg-slate-50 p-4 border-t border-slate-100">
+            {editMode ? (
+              <div className="flex flex-col space-y-3 animate-in fade-in slide-in-from-top-2">
+                <label className="text-xs font-semibold text-slate-600">Auto-publish updates to tag:</label>
                 <div className="flex space-x-2">
                   <input 
                     type="text" 
-                    value={republishTag}
-                    onChange={(e) => setRepublishTag(e.target.value)}
+                    value={draftTag}
+                    onChange={(e) => setDraftTag(e.target.value)}
                     className="flex-1 px-3 py-1.5 text-sm rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none"
+                    placeholder="e.g. processed-data"
                   />
                   <button 
                     onClick={() => {
-                      onRepublish(consumer, republishTag);
-                      setShowRepublishOpts(false);
+                      if(draftTag.trim()){
+                        onSetRepublish(consumer.id, draftTag.trim(), true);
+                        setEditMode(false);
+                      }
                     }}
                     className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors"
                   >
-                    Send
+                    Start
                   </button>
                   <button 
-                    onClick={() => setShowRepublishOpts(false)}
+                    onClick={() => setEditMode(false)}
                     className="bg-slate-200 hover:bg-slate-300 text-slate-700 px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors"
                   >
                     Cancel
                   </button>
                 </div>
               </div>
+            ) : hasConfig ? (
+              <div className="flex items-center justify-between p-1">
+                <div className="flex items-center space-x-2">
+                  {isActive ? (
+                    <div className="relative flex h-3 w-3 mr-1">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-3 w-3 bg-blue-500"></span>
+                    </div>
+                  ) : (
+                    <Pause size={14} className="text-slate-400 mr-1" />
+                  )}
+                  <span className="text-sm font-medium text-slate-700">
+                    {isActive ? "Auto-publishing to:" : "Paused publishing to:"} 
+                    <span className="ml-1 font-bold text-slate-900 bg-slate-200 px-1.5 py-0.5 rounded">{consumer.republishTag}</span>
+                  </span>
+                </div>
+                <div className="flex items-center space-x-1">
+                  <button 
+                    onClick={() => onSetRepublish(consumer.id, consumer.republishTag, !isActive)}
+                    className={`p-1.5 rounded-md transition-colors ${isActive ? 'bg-amber-100 hover:bg-amber-200 text-amber-700' : 'bg-emerald-100 hover:bg-emerald-200 text-emerald-700'}`}
+                    title={isActive ? "Pause auto-publish" : "Resume auto-publish"}
+                  >
+                    {isActive ? <Pause size={16} /> : <Play size={16} />}
+                  </button>
+                  <button 
+                    onClick={() => setEditMode(true)}
+                    className="p-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-md transition-colors"
+                    title="Edit republish tag"
+                  >
+                    <Edit size={16} />
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button 
+                onClick={() => setEditMode(true)}
+                disabled={consumer.currentValue === null}
+                className="w-full flex items-center justify-center space-x-2 py-2 px-4 rounded-lg text-sm font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 disabled:opacity-50 disabled:hover:bg-blue-50 transition-colors"
+              >
+                <RefreshCw size={16} />
+                <span>Setup Auto-Republish</span>
+              </button>
             )}
           </div>
         </div>
